@@ -1,0 +1,407 @@
+#!venv/bin/python
+
+import asyncio
+import io
+import json
+import math
+import os
+import re
+import sys
+import urllib
+
+from pyppeteer import launch
+from PIL import Image
+from zipfile import ZipFile
+
+RE_ARGS = {
+    'id': re.compile(r'^[0-9a-zA-Z-]+$'),
+    'key': re.compile(r'^[0-9a-zA-Z-]+$'),
+    'template': re.compile(r'^[a-z]+$', re.IGNORECASE),
+    'output': re.compile(r'^(png|pdf|html)$'),
+}
+
+PNG_WIDTH = 800
+PNG_HEIGHT = 1200
+ROOT = os.path.dirname(__file__)
+
+
+class CDU_DataLoader():
+    '''
+    Used by A10C to auto-enter waypoints
+
+    http://www.virtual-jabog32.de/forum/viewtopic.php?f=38&t=11569
+    '''
+
+    def __init__(self, waypoints):
+
+        self._waypoints = waypoints
+        self._wp_names = {}
+        self.content = ""
+        self.generate()
+
+    def generate(self):
+
+        # Hold alt as our default unless specified elsewhere
+        alt = 0
+
+        for wp in self._waypoints:
+
+            # Skip waypoints that have empty floats
+            lat = self.fmt_ll(wp['lat'])
+            lon = self.fmt_ll(wp['lon'], False)
+
+            try:
+                alt = int(wp['alt'])
+            except ValueError:
+                # We can pass now to hit the updated alt
+                pass
+
+            if not lat or not lon:
+                continue
+
+            # We prefix the name with M to help ensure no collisions in game
+            # waypoints are limited to 12 characters, so we truncate
+            name = ("M " + wp['name'])[0:12].strip()
+
+            # They also can't be identical, so if we encounter the same name
+            # add "space ID"
+            if name in self._wp_names:
+                self._wp_names[name] += 1
+                suffix = " " + str(self._wp_names[name])
+                remove = (len(suffix) + len(name)) - 12
+                if remove > 0:
+                    name = name[0:-remove]
+                name += suffix
+            else:
+                self._wp_names[name] = 1
+
+            # However, when we write them out, we pad them all to 12 so
+            # autocomplete doesn't autocomplete when subsequent points are
+            # prefixed
+            #
+            # E.g: Racetrack followed by Race
+            self.content += "{} {} EL{:05} {} {:12}\n".format(
+                lat,
+                lon,
+                alt,
+                'T' + wp['tot'].replace(':', '') + '00',
+                name)
+
+    def fmt_ll(self, wp, lat=True):
+
+        try:
+            work = float(wp)
+        except ValueError:
+            return None
+
+        positive = work > 0
+        work = abs(work)
+
+        degs = math.floor(work)
+        work -= degs
+        work *= 60
+
+        mins = math.floor(work)
+        work -= mins
+        work *= 1000
+
+        secs = round(work)
+
+        if secs == 60:
+            mins += 1
+        if mins == 60:
+            degs += 1
+
+        if lat:
+            lat_str = 'N' if positive else 'S'
+        else:
+            lat_str = 'E' if positive else 'W'
+
+        if lat:
+            lat_str += '%02d' % degs
+        else:
+            lat_str += '%03d' % degs
+
+        lat_str += '%02d' % mins
+        lat_str += '%03d' % secs
+
+        return lat_str
+
+
+async def get_html(url):
+
+    browser = await launch({
+        'headless': True,
+        'executablePath': '/usr/share/chromium/588429/chrome',
+        'userDataDir': '/tmp/httpd/pyppeteer',
+    })
+
+    page = await browser.newPage()
+    page.on('console', lambda x: print("CONSOLE LOG:", x.text));
+    page.on('error', lambda x: print("ERROR:", x));
+    page.on('pageerror', lambda x: print("PAGE ERROR:", x));
+
+    print("LOAD: " + url);
+    await page.goto(url)
+    try:
+        await page.waitForSelector("#page_count", {"timeout": 2000})
+    except:
+        print ("Exception waiting for page_count")
+
+    content = await page.evaluate('() => document.documentElement.innerHTML')
+    await browser.close()
+    return content.encode('utf-8')
+
+async def get_image(url):
+
+    browser = await launch({
+        'headless': True,
+        'executablePath': '/usr/share/chromium/588429/chrome',
+        'userDataDir': '/tmp/httpd/pyppeteer',
+    })
+
+    page = await browser.newPage()
+
+    await page.goto(url)
+    await page.waitForSelector("#page_count")
+
+    page_count = await page.evaluate('''
+    () => {
+        return parseInt(document.getElementById("page_count").textContent);
+    }
+    ''')
+
+    await page.setViewport({
+        'width': PNG_WIDTH,
+        'height': PNG_HEIGHT*page_count})
+
+    screenshot = await page.screenshot({'type': 'png'})
+    await browser.close()
+
+    return (page_count, screenshot)
+
+
+async def get_pdf(url):
+    browser = await launch({
+        'headless': True,
+        'executablePath': '/usr/share/chromium/588429/chrome',
+        'userDataDir': '/tmp/httpd/pyppeteer',
+    })
+
+    page = await browser.newPage()
+
+    await page.goto(url)
+    await page.waitForSelector("#page_count")
+
+    page_count = await page.evaluate('''
+    () => {
+        return parseInt(document.getElementById("page_count").textContent);
+    }
+    ''')
+
+    await page.setViewport({
+        'width': PNG_WIDTH,
+        'height': PNG_HEIGHT*page_count
+    })
+
+    pdf = await page.pdf({
+        'width': '%spx' % PNG_WIDTH,
+        'height': '%spx' % PNG_HEIGHT,
+        'margin': {
+            'top': 0,
+            'bottom': 0,
+            'left': 0,
+            'right': 0
+        },
+        'printBackground': True,
+    })
+
+    await browser.close()
+
+    return pdf
+
+
+def main():
+
+    qs = urllib.parse.parse_qs(os.environ.get('QUERY_STRING', ""))
+
+    params = {}
+    for key, re in RE_ARGS.items():
+        if key not in qs or not re.match(qs[key][0]):
+            print("Content-Type: text/html")
+            print("Status: 400 Bad Request\n")
+            sys.exit(0)
+        else:
+            params[key] = qs[key][0]
+
+    # Validate mdc exists
+    mdc_file = os.path.join(ROOT, 'mdcs', '%s.json' % params['key'])
+    if not os.path.isfile(mdc_file):
+        print("Content-Type: text/html")
+        print("Status: 400 Bad Request\n")
+        sys.exit(0)
+
+    mdc_modified = os.path.getmtime(mdc_file)
+
+    with open(mdc_file) as fh:
+        mdc = json.load(fh)
+
+    # If we are A10, we provide the CDU file also
+    ac = mdc['flight']['flight-airframe']
+    cdu = None
+
+    if ac == 'A-10C':
+        cdu = CDU_DataLoader(mdc['waypoint']['waypoints']).content
+
+    url = (
+        '{scheme}://{host}/{root}'
+        '/templates/{template}/template.htm?kb={key}').format(
+        scheme=os.environ.get('REQUEST_SCHEME'),
+        host=os.environ.get('HTTP_HOST'),
+        root=os.path.dirname(os.environ.get('SCRIPT_NAME')),
+        template=params['template'],
+        key=params['key'])
+
+    if params['output'] == "html":
+        print("Content-Type: text/plain\n")
+        content = asyncio.get_event_loop().run_until_complete(get_html(url))
+        print("-"*60)
+        print("-"*60)
+        sys.stdout.flush()
+        sys.stdout.buffer.write(content)
+        return
+
+    if params['output'] == "pdf":
+
+        # Check if we have a cache
+        cache_file = os.path.join(ROOT, 'cache', params['key'])
+        if cdu:
+            cache_file += '.zip'
+            if (os.path.exists(cache_file) and mdc_modified < os.path.getmtime(cache_file)):
+                print ("Content-Disposition: attachment; "
+                       "filename=\"MDC-%s.zip\"" % params['id'])
+                print ("Content-Type: application/zip\n")
+                sys.stdout.flush()
+                with open(cache_file, 'rb') as fh:
+                    sys.stdout.buffer.write(fh.read())
+                return
+        else:
+            cache_file += '.pdf'
+            if (os.path.exists(cache_file) and mdc_modified < os.path.getmtime(cache_file)):
+                print ("Content-Disposition: attachment; "
+                       "filename=\"MDC-%s.pdf\"" % params['id'])
+                print("Content-Type: application/pdf\n")
+                sys.stdout.flush()
+                with open(cache_file, 'rb') as fh:
+                    sys.stdout.buffer.write(fh.read())
+                return
+
+        pdf = asyncio.get_event_loop().run_until_complete(get_pdf(url))
+
+        if cdu:
+            # Then we zip it up instead
+            zipf = ZipFile(cache_file, 'w')
+            zipf.writestr('%s.txt' % params['id'], cdu)
+            zipf.writestr('%s.pdf' % params['id'], pdf)
+            zipf.close()
+
+            print ("Content-Disposition: attachment; "
+                   "filename=\"MDC-%s.zip\"" % params['id'])
+            print ("Content-Type: application/zip\n")
+            sys.stdout.flush()
+            with open(cache_file, 'rb') as fh:
+                sys.stdout.buffer.write(fh.read())
+            return
+
+        print ("Content-Disposition: attachment; "
+               "filename=\"MDC-%s.pdf\"" % params['id'])
+        print("Content-Type: application/pdf\n")
+        sys.stdout.flush()
+        with open(cache_file, 'wb') as fh:
+            fh.write(pdf)
+        sys.stdout.buffer.write(pdf)
+        return
+
+    if params['output'].startswith("png"):
+
+        cache_base = os.path.join(ROOT, 'cache', params['key'])
+
+        # See if a png exists, as we don't know how many pages tehre are
+        if not cdu:
+            cache_file = cache_base + '.png'
+            if (os.path.exists(cache_file) and mdc_modified < os.path.getmtime(cache_file)):
+                print ("Content-Disposition: attachment; "
+                       "filename=\"0000-%s-0001.png\"" % params['id'])
+                print("Content-Type: image/png\n")
+                sys.stdout.flush()
+                with open(cache_file, 'rb') as fh:
+                    sys.stdout.buffer.write(fh.read())
+                return
+
+        # Otherwise see if a zip exists
+        else:
+            cache_file = cache_base + '.zip'
+            if (os.path.exists(cache_file) and mdc_modified < os.path.getmtime(cache_file)):
+                print ("Content-Disposition: attachment; "
+                       "filename=\"MDC-%s.zip\"" % params['id'])
+                print ("Content-Type: application/zip\n")
+                sys.stdout.flush()
+                with open(cache_file, 'rb') as fh:
+                    sys.stdout.buffer.write(fh.read())
+                return
+
+
+        pages, png = asyncio.get_event_loop().run_until_complete(
+            get_image(url))
+
+        if pages == 1 and not cdu:
+            cache_file = cache_base + '.png'
+            print ("Content-Disposition: attachment; "
+                   "filename=\"0000-%s-0001.png\"" % params['id'])
+            print("Content-Type: image/png\n")
+            sys.stdout.flush()
+
+            with open(cache_file, 'wb') as fh:
+                fh.write(png);
+
+            sys.stdout.buffer.write(png)
+            return
+
+        # Zip up each page
+        cache_file = cache_base + '.zip'
+        zipf = ZipFile(cache_file, 'w')
+
+        if cdu:
+            zipf.writestr('%s.txt' % params['id'], cdu)
+
+        # Crop out pages
+        if pages == 1:
+            zipf.writestr('0000-%s-001.png' % params['id'], png)
+        else:
+            # Load complete image into PIL for Cropping
+            im1 = Image.open(io.BytesIO(png))
+
+            for x in range(pages):
+                cr = im1.crop((0, PNG_HEIGHT*x, PNG_WIDTH, PNG_HEIGHT*(x+1)))
+                f = io.BytesIO()
+                cr.save(f, "PNG")
+                f.seek(0)
+                zipf.writestr(
+                    '0000-%s-%03d.png' % (params['id'], x+1), f.read())
+
+        zipf.close()
+
+        print ("Content-Disposition: attachment; "
+               "filename=\"MDC-%s.zip\"" % params['id'])
+        print ("Content-Type: application/zip\n")
+        sys.stdout.flush()
+        with open(cache_file, 'rb') as fh:
+            sys.stdout.buffer.write(fh.read())
+        return
+
+    print("Content-Type: text/plain\n")
+    print("UNKNOWN")
+
+
+if __name__ == "__main__":
+    main()
